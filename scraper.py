@@ -105,8 +105,11 @@ IGNORE_EXTENSIONS = {
 # ─────────────────────────────────────────────
 
 def normalizar_url(url: str) -> str:
-    """Remove fragmento (#âncora) e query strings de rastreamento."""
+    """Remove fragmento (#âncora), força HTTPS e normaliza a barra final."""
     url, _ = urldefrag(url)
+    # Forçar HTTPS — o servidor rejeita (403/404) requisições via HTTP puro
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
     return url.rstrip("/") + "/"
 
 
