@@ -154,6 +154,7 @@ RODAPE_ANCORA_FIM    = "Nossas Redes"
 # documentado em outras páginas deste site), o não-guloso para na 1ª
 # ocorrência, preservando qualquer conteúdo real que exista entre as duas.
 # O guloso apagaria silenciosamente todo esse conteúdo sem aviso no log.
+
 RODAPE_RE = re.compile(
     re.escape(RODAPE_ANCORA_INICIO) + r".*?" + re.escape(RODAPE_ANCORA_FIM),
     re.DOTALL,
