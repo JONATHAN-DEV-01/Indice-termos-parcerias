@@ -1,26 +1,48 @@
 """
-scraper-documentos.py  (entrypoint: ScraperMROSC.py)
-=====================================================
-Extrai texto página a página de documentos PDF listados em um arquivo de
-configuração JSON e gera um índice (indice-documentos.json) para alimentar
-a busca client-side do Portal de Parcerias da Prefeitura de São Paulo.
+ScraperMROSC.py  (v2 -- extracao com consciencia de secao)
+===========================================================
+Extrai texto pagina a pagina de MROSC_final.pdf usando pdfplumber,
+classificando cada pagina segundo a secao do documento e separando
+titulos de conteudo com base na familia tipografica de cada caractere.
 
-Cada registro de saída contém:
-  - documento : nome de exibição
-  - url       : URL pública do PDF (usada no link de resultado de busca)
-  - pagina    : número da página (1-based) dentro do PDF
-  - conteudo  : texto limpo extraído dessa página
+Secoes detectadas automaticamente pelas paginas divisorias:
+  Secao 1 -- institucional  (capa, ficha tecnica, sumario, introducao)
+  Secao 2 -- indice         (tabela Onde Encontrar o Termo)
+  Secao 3 -- glossario      (definicoes A-Z)
+  Secao 4 -- lei            (texto da Lei nr 13.019/2014)
+
+Regras de extracao por secao:
+  institucional : titulos=[]  conteudo=todo nao-ruido
+  indice        : titulos=[]  conteudo=todo nao-ruido
+  glossario     : titulos=BricolageGrotesque-Bold ~17.6pt e ~12.9pt
+                  discard=BricolageGrotesque-Bold ~48.9pt (letras A B C)
+                  conteudo=tudo o mais (incl. boxes 15.4pt)
+  lei           : titulos=Lato-Black ~7.5pt (capitulos/secoes da lei)
+                  conteudo=tudo o mais
+
+Ruido descartado em todas as secoes:
+  - BricolageGrotesque24ptSemiCondensed-SemiBold (rodape)
+  - Lato-Bold ~8pt com apenas digitos (numero de pagina)
+
+Saida: indice-documentos.novo.json (NUNCA sobrescreve indice-documentos.json)
+
+Formato de cada registro:
+  {
+    "documento": "MROSC de A a Z",
+    "url": "...",
+    "pagina": 255,
+    "secao": "glossario",
+    "titulos": ["Termo A", "Termo B"],
+    "conteudo": "texto corrido limpo"
+  }
 
 Uso:
-    python ScraperMROSC.py                              # usa config e saída padrão
-    python ScraperMROSC.py -c documentos.json           # config personalizada
-    python ScraperMROSC.py -o meu-indice.json           # saída personalizada
-    python ScraperMROSC.py -c docs.json -o idx.json     # ambos
-    python ScraperMROSC.py --min-chars 100              # limiar de suspeita
-    python ScraperMROSC.py --preview                    # mostra antes/depois sem gravar
+    python ScraperMROSC.py                    # gera indice-documentos.novo.json
+    python ScraperMROSC.py --preview          # mostra amostras e pede confirmacao
+    python ScraperMROSC.py -o saida.json      # saida personalizada
 
-Dependências:
-    pip install pymupdf
+Dependencias:
+    pip install pdfplumber
 """
 
 from __future__ import annotations
@@ -30,51 +52,70 @@ import json
 import logging
 import re
 import sys
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 
 # ---------------------------------------------------------------------------
-# Configuração padrão embutida
-# ---------------------------------------------------------------------------
-# Edite este bloco para adicionar novos documentos SEM alterar a lógica do
-# script.  Você também pode apontar para um JSON externo com -c / --config.
+# Configuracao padrao embutida
 # ---------------------------------------------------------------------------
 
 DEFAULT_DOCUMENTS: list[dict] = [
     {
         "nome": "MROSC de A a Z",
-        "arquivo": "MROSC_final.pdf",   # caminho relativo ao diretório do script
-                                        # ou absoluto; ajuste conforme o servidor
+        "arquivo": "MROSC_final.pdf",
         "url": (
             "https://hom-portaldeparcerias.prefeitura.sp.gov.br"
             "/wp-content/uploads/2026/09/MROSC_final.pdf"
         ),
     },
-    # Adicione outros documentos aqui seguindo o mesmo formato:
-    # {
-    #     "nome": "Nome de Exibição",
-    #     "arquivo": "caminho/para/arquivo.pdf",
-    #     "url": "https://...",
-    # },
 ]
 
-# Limiar padrão de caracteres por página abaixo do qual a página é sinalizada
-# como suspeita (possível scan sem camada de texto).
-DEFAULT_MIN_CHARS: int = 80
+DEFAULT_MIN_CHARS: int = 30
+DEFAULT_OUTPUT: str = "indice-documentos.novo.json"
 
-# Caminho padrão de saída (relativo ao diretório de trabalho atual).
-DEFAULT_OUTPUT: str = "indice-documentos.json"
+# Arquivo que NUNCA deve ser sobrescrito por este script.
+_PROTECTED_OUTPUT = "indice-documentos.json"
 
 # ---------------------------------------------------------------------------
-# Remoção de boilerplate (cabeçalhos/rodapés repetidos)
+# Deteccao de secoes
 # ---------------------------------------------------------------------------
-#
-# Limiar de frequência para considerar uma linha como boilerplate.
-# Uma linha (normalizada) que aparece em >= BOILERPLATE_THRESHOLD das páginas
-# de um documento é candidata a âncora de corte.
-BOILERPLATE_THRESHOLD: float = 0.70
+
+# Paginas divisorias sao identificadas por terem pouquissimos caracteres
+# (so o numero de pagina duplicado + o titulo da secao).
+DIVIDER_MAX_CHARS: int = 60
+
+# ---------------------------------------------------------------------------
+# Classificacao de fontes
+# ---------------------------------------------------------------------------
+
+# Rodape: BricolageGrotesque24ptSemiCondensed-SemiBold em qualquer tamanho
+FOOTER_FONT_SUFFIX = "BricolageGrotesque24ptSemiCondensed-SemiBold"
+
+# Numero de pagina: Lato-Bold ~8pt com 1-4 digitos
+PAGE_NUM_FONT_SUFFIX = "Lato-Bold"
+PAGE_NUM_SIZE        = 8.0
+PAGE_NUM_SIZE_TOL    = 0.6   # aceita 7.4pt a 8.6pt
+PAGE_NUM_MAX_CHARS   = 4
+
+# Fonte dos titulos/separadores do glossario
+GLOSSARIO_BOLD = "BricolageGrotesque36ptSemiCondensed-Bold"
+
+# Tamanhos que viram TITULO no glossario: (centro_pt, tolerancia_pt)
+GLOSSARIO_TITULO_RANGES = [
+    (17.6, 1.5),   # nome do verbete
+    (12.9, 0.5),   # sub-titulo dentro do verbete
+]
+
+# Tamanho descartado no glossario: letra-separador A, B, C...
+GLOSSARIO_DISCARD_RANGE = (48.9, 5.0)
+
+# Na secao da lei: Lato-Black ~7.5pt = titulo de capitulo/secao
+LEI_TITULO_FONT = "Lato-Black"
+LEI_TITULO_SIZE = 7.5
+LEI_TITULO_TOL  = 0.5
+
+# Tolerancia Y (em pontos) para considerar chars na mesma linha
+Y_SAME_LINE_TOL = 5.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -94,8 +135,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DocumentConfig:
-    """Configuração de um único documento PDF a ser processado."""
-
+    """Configuracao de um documento PDF a processar."""
     nome: str
     arquivo: Path
     url: str
@@ -103,306 +143,329 @@ class DocumentConfig:
 
 @dataclass
 class PageRecord:
-    """Registro de uma página extraída, pronto para serialização JSON."""
-
+    """Registro de uma pagina extraida com classificacao de secao."""
     documento: str
     url: str
     pagina: int       # 1-based
-    conteudo: str
+    secao: str        # institucional | indice | glossario | lei
+    titulos: list     # titulos/verbetes da pagina (lista de strings)
+    conteudo: str     # texto corrido limpo
 
 
 @dataclass
 class RunSummary:
-    """Acumulador de métricas para o resumo final da execução."""
-
+    """Acumulador de metricas."""
     documentos_processados: int = 0
     documentos_com_erro: int = 0
     total_paginas: int = 0
-    total_caracteres_antes: int = 0
-    total_caracteres_depois: int = 0
-    paginas_suspeitas: list[dict] = field(default_factory=list)
+    total_chars_conteudo: int = 0
+    paginas_suspeitas: list = field(default_factory=list)
+    secao_contagem: dict = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
-# Carregamento de configuração
+# Limpeza de texto (aplicada ao conteudo)
+# ---------------------------------------------------------------------------
+
+_HYPHEN_BREAK = re.compile(r"-\n(?=[a-z\u00e0-\u00fc])", re.IGNORECASE)
+_MULTI_SPACE  = re.compile(r"[ \t]{2,}")
+_MULTI_NL     = re.compile(r"\n{3,}")
+_CTRL_CHARS   = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def clean_text(raw: str) -> str:
+    """Limpa artefatos tipograficos do texto extraido."""
+    text = _CTRL_CHARS.sub("", raw)
+    text = _HYPHEN_BREAK.sub("", text)
+    text = _MULTI_SPACE.sub(" ", text)
+    text = _MULTI_NL.sub("\n\n", text)
+    return text.strip()
+
+# ---------------------------------------------------------------------------
+# Utilitarios de fonte
 # ---------------------------------------------------------------------------
 
 
-def load_config(config_path: Path | None) -> list[DocumentConfig]:
-    """Carrega a lista de documentos a processar.
+def _font_base(fontname: str) -> str:
+    """Remove prefixo de subconjunto (ex.: ONITTQ+Lato-Regular -> Lato-Regular)."""
+    return fontname.split("+", 1)[-1] if "+" in fontname else fontname
 
-    Se *config_path* for fornecido, lê um JSON externo com a lista.
-    Caso contrário, utiliza DEFAULT_DOCUMENTS definido no topo do script.
 
-    O JSON externo deve ser uma lista de objetos com as chaves:
-        "nome"    – nome de exibição
-        "arquivo" – caminho do PDF (absoluto ou relativo ao JSON)
-        "url"     – URL pública do PDF
+def _is_noise(fontname_raw: str, size: float, text: str) -> bool:
+    """Retorna True para rodape e numero de pagina."""
+    base = _font_base(fontname_raw)
+    if base == FOOTER_FONT_SUFFIX:
+        return True
+    stripped = text.strip()
+    if (
+        base == PAGE_NUM_FONT_SUFFIX
+        and abs(size - PAGE_NUM_SIZE) <= PAGE_NUM_SIZE_TOL
+        and stripped.isdigit()
+        and len(stripped) <= PAGE_NUM_MAX_CHARS
+    ):
+        return True
+    return False
 
-    Levanta ValueError se o JSON estiver malformado.
+
+def _classify_char(font_base: str, size: float, section: str) -> str:
+    """Classifica um char como titulo, conteudo ou discard."""
+    if section == "glossario":
+        if font_base == GLOSSARIO_BOLD:
+            dc, dt = GLOSSARIO_DISCARD_RANGE
+            if abs(size - dc) <= dt:
+                return "discard"
+            for tc, tt in GLOSSARIO_TITULO_RANGES:
+                if abs(size - tc) <= tt:
+                    return "titulo"
+            return "conteudo"
+        return "conteudo"
+
+    if section == "lei":
+        if font_base == LEI_TITULO_FONT and abs(size - LEI_TITULO_SIZE) <= LEI_TITULO_TOL:
+            return "titulo"
+        return "conteudo"
+
+    # institucional e indice: tudo vai para conteudo, sem titulos
+    return "conteudo"
+
+# ---------------------------------------------------------------------------
+# Agrupamento de chars em strings
+# ---------------------------------------------------------------------------
+
+
+def _build_lines(chars: list) -> list:
+    """Agrupa chars (com categoria em ch['_cat']) em linhas, em ordem de leitura."""
+    if not chars:
+        return []
+
+    sorted_chars = sorted(chars, key=lambda c: (c.get("top", 0), c.get("x0", 0)))
+
+    lines: list = []
+    current: list = []
+    line_y = None
+
+    for ch in sorted_chars:
+        y = ch.get("top", 0)
+        if line_y is None or abs(y - line_y) <= Y_SAME_LINE_TOL:
+            current.append(ch)
+            if line_y is None:
+                line_y = y
+        else:
+            lines.append(current)
+            current = [ch]
+            line_y = y
+
+    if current:
+        lines.append(current)
+
+    for line in lines:
+        line.sort(key=lambda c: c.get("x0", 0))
+
+    return lines
+
+
+def _lines_to_titles_and_conteudo(lines: list) -> tuple:
     """
+    Percorre as linhas da pagina em ordem de leitura e separa titulos de
+    conteudo com base na categoria de cada trecho (titulo/conteudo).
+
+    Um titulo que continua na fonte de titulo em linhas seguintes (sem
+    conteudo entre elas) e tratado como o MESMO titulo, quebrado em varias
+    linhas, e as partes sao juntadas com espaco. Quando a fonte muda para
+    conteudo, o titulo atual e fechado; se a fonte voltar a ser titulo mais
+    adiante, isso inicia um NOVO titulo.
+    """
+    titulos: list = []
+    conteudo_parts: list = []
+    current_title_parts: list = []
+    in_title = False
+
+    for line in lines:
+        runs: list = []
+        run_cat = None
+        run_chars: list = []
+        for ch in line:
+            cat = ch["_cat"]
+            if run_cat is None or cat == run_cat:
+                run_chars.append(ch)
+                run_cat = cat
+            else:
+                runs.append((run_cat, run_chars))
+                run_chars = [ch]
+                run_cat = cat
+        if run_chars:
+            runs.append((run_cat, run_chars))
+
+        for run_cat, run_chars in runs:
+            text = "".join(c.get("text", "") for c in run_chars).strip()
+            if not text:
+                continue
+
+            if run_cat == "titulo":
+                current_title_parts.append(text)
+                in_title = True
+            else:
+                if in_title:
+                    titulos.append(" ".join(current_title_parts))
+                    current_title_parts = []
+                    in_title = False
+                conteudo_parts.append(text)
+
+    if in_title and current_title_parts:
+        titulos.append(" ".join(current_title_parts))
+
+    conteudo = clean_text("\n".join(conteudo_parts))
+    return titulos, conteudo
+
+# ---------------------------------------------------------------------------
+# Carregamento de configuracao
+# ---------------------------------------------------------------------------
+
+
+def load_config(config_path: Path | None) -> list:
+    """Carrega a lista de documentos a processar."""
     if config_path is not None:
-        logger.info("Carregando configuração de: %s", config_path)
+        logger.info("Carregando configuracao de: %s", config_path)
         raw = json.loads(config_path.read_text(encoding="utf-8"))
         base_dir = config_path.parent
     else:
-        logger.info("Usando configuração embutida (DEFAULT_DOCUMENTS).")
+        logger.info("Usando configuracao embutida (DEFAULT_DOCUMENTS).")
         raw = DEFAULT_DOCUMENTS
-        base_dir = Path(__file__).parent   # relativo ao próprio script
+        base_dir = Path(__file__).parent
 
-    documents: list[DocumentConfig] = []
+    documents = []
     for entry in raw:
         for key in ("nome", "arquivo", "url"):
             if key not in entry:
-                raise ValueError(
-                    "Entrada de configuração sem a chave obrigatória "
-                    f"'{key}': {entry!r}"
-                )
+                raise ValueError(f"Entrada sem chave obrigatoria '{key}'.: {entry!r}")
         arquivo = Path(entry["arquivo"])
         if not arquivo.is_absolute():
             arquivo = (base_dir / arquivo).resolve()
-        documents.append(DocumentConfig(
-            nome=entry["nome"],
-            arquivo=arquivo,
-            url=entry["url"],
-        ))
+        documents.append(DocumentConfig(nome=entry["nome"], arquivo=arquivo, url=entry["url"]))
 
     logger.info("Total de documentos configurados: %d", len(documents))
     return documents
 
 # ---------------------------------------------------------------------------
-# Extração de texto via PyMuPDF
+# Deteccao de secoes
 # ---------------------------------------------------------------------------
 
 
-def open_pdf(path: Path):
-    """Abre um documento PDF com PyMuPDF e retorna o objeto Document.
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().split())
 
-    Levanta ImportError se pymupdf não estiver instalado, e
-    RuntimeError se o arquivo não puder ser aberto (corrompido, criptografado,
-    formato inválido, etc.).
+
+def _detect_sections(pdf_path: Path):
+    """
+    Varre o PDF e detecta as paginas divisorias de cada secao.
+
+    Retorna (page_section_fn, dividers, total_pages) onde:
+      page_section_fn(page_num) -> str  ("institucional"|"indice"|"glossario"|"lei")
+      dividers: dict com as primeiras paginas de cada secao
+      total_pages: int
     """
     try:
-        import pymupdf as fitz  # pymupdf >= 1.24 expõe o namespace pymupdf diretamente
-    except ImportError:
-        try:
-            import fitz  # fallback para versões mais antigas
-        except ImportError as exc:
-            raise ImportError(
-                "PyMuPDF não está instalado. Execute: pip install pymupdf"
-            ) from exc
-
-    try:
-        doc = fitz.open(str(path))
-    except Exception as exc:
-        raise RuntimeError(
-            f"Não foi possível abrir o PDF '{path}': {exc}"
+        import pdfplumber
+    except ImportError as exc:
+        raise ImportError(
+            "pdfplumber nao esta instalado. Execute: pip install pdfplumber"
         ) from exc
 
-    return doc
+    dividers: dict = {}
 
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        total = len(pdf.pages)
+        logger.info("Detectando secoes em %d paginas...", total)
 
-def extract_pages_text(path: Path) -> Iterator[tuple[int, str]]:
-    """Itera pelas páginas do PDF e gera tuplas (numero_pagina_1based, texto_bruto).
+        for page_index in range(total):
+            page = pdf.pages[page_index]
+            page_num = page_index + 1
+            raw = page.extract_text() or ""
+            chars_count = len(raw.strip())
 
-    Utiliza PyMuPDF (fitz) para extração.  O texto retornado ainda não foi
-    submetido à limpeza — use clean_text() em seguida.
+            if chars_count >= DIVIDER_MAX_CHARS:
+                continue
 
-    IMPORTANTE: abre o documento *antes* de entrar no loop de geração para
-    que erros de abertura (arquivo inexistente, corrompido, etc.) sejam
-    levantados imediatamente — não de forma lazy na primeira iteração, o que
-    dificultaria a captura correta em build_records().
+            norm = _normalize(raw)
 
-    Levanta RuntimeError (via open_pdf) se o arquivo não puder ser lido.
-    """
-    # Abre aqui (fora do bloco de yield) para propagar o erro de imediato.
-    doc = open_pdf(path)
+            if "indice" not in dividers and "onde encontrar o termo" in norm:
+                dividers["indice"] = page_num
+                logger.info("  Divisoria indice    : pagina %d", page_num)
 
-    def _page_generator() -> Iterator[tuple[int, str]]:
-        try:
-            for page_index in range(doc.page_count):
-                page = doc.load_page(page_index)
-                raw_text: str = page.get_text("text")
-                yield (page_index + 1, raw_text)
-        finally:
-            doc.close()
+            elif (
+                "glossario" not in dividers
+                and "indice" in dividers
+                and page_num > dividers["indice"]
+                and "gloss" in norm
+            ):
+                dividers["glossario"] = page_num
+                logger.info("  Divisoria glossario : pagina %d", page_num)
 
-    return _page_generator()
+            elif "lei" not in dividers and "texto da lei" in norm:
+                dividers["lei"] = page_num
+                logger.info("  Divisoria lei       : pagina %d", page_num)
 
-# ---------------------------------------------------------------------------
-# Limpeza de texto
-# ---------------------------------------------------------------------------
+    for key in ("indice", "glossario", "lei"):
+        if key not in dividers:
+            logger.warning("Divisoria '%s' NAO encontrada!", key)
 
-# Padrão para hifenização quebrada no final de linha:
-#   "configu-\nração"  →  "configuração"
-_HYPHEN_BREAK = re.compile(r"-\n(?=[a-záàâãéèêíïóôõöúüçA-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÜÇ])")
+    si = dividers.get("indice")
+    sg = dividers.get("glossario")
+    sl = dividers.get("lei")
 
-# Múltiplos espaços e tabulações → espaço único
-_MULTI_SPACE = re.compile(r"[ \t]{2,}")
+    def page_section(p: int) -> str:
+        if sl and p >= sl:
+            return "lei"
+        if sg and p >= sg:
+            return "glossario"
+        if si and p >= si:
+            return "indice"
+        return "institucional"
 
-# Quebras de linha múltiplas (mais de duas consecutivas) → parágrafo duplo
-_MULTI_NEWLINE = re.compile(r"\n{3,}")
-
-# Caracteres de controle (exceto \n e \t que já são tratados acima)
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
-def clean_text(raw: str) -> str:
-    """Aplica limpeza básica ao texto extraído de uma página PDF.
-
-    Operações realizadas (por ordem):
-    1. Remove caracteres de controle invisíveis.
-    2. Recompõe palavras hifenizadas que foram quebradas no fim da linha.
-    3. Colapsa múltiplos espaços/tabulações em um único espaço.
-    4. Reduz sequências de mais de duas quebras de linha a exatamente duas.
-    5. Remove espaços no início e fim do texto.
-
-    Intencionalmente NÃO realiza:
-    - Conversão para minúsculas.
-    - Remoção ou normalização de acentos.
-    - Qualquer outra transformação semântica — essas ficam para o motor JS.
-    """
-    text = _CONTROL_CHARS.sub("", raw)
-    text = _HYPHEN_BREAK.sub("", text)
-    text = _MULTI_SPACE.sub(" ", text)
-    text = _MULTI_NEWLINE.sub("\n\n", text)
-    return text.strip()
+    return page_section, dividers, total
 
 # ---------------------------------------------------------------------------
-# Detecção e remoção de boilerplate (rodapés/cabeçalhos repetidos)
+# Extracao de uma pagina
 # ---------------------------------------------------------------------------
 
-# Regex para normalizar números isolados em linhas — usada ao comparar padrões
-# de linhas de rodapé sem que o número de página variável quebre a detecção.
-_DIGITS_ONLY = re.compile(r"^\d+$")
 
-
-def _normalize_line(line: str) -> str:
-    """Normaliza uma linha para comparação de frequência.
-
-    Substitui linhas compostas apenas por dígitos por um placeholder neutro,
-    preservando o conteúdo textual real para fins de comparação estrutural.
+def _extract_page(page, section: str):
     """
-    stripped = line.strip()
-    return "<NUM>" if _DIGITS_ONLY.match(stripped) else stripped
+    Extrai (titulos, conteudo, noise_count) de uma pagina pdfplumber.
 
-
-def detect_boilerplate_anchors(
-    pages_text: list[str],
-    tail_lines: int = 6,
-    threshold: float = BOILERPLATE_THRESHOLD,
-) -> list[str]:
-    """Identifica linhas de rodapé que se repetem em alta proporção das páginas.
-
-    Estratégia:
-    - Coleta as últimas *tail_lines* linhas não-vazias de cada página.
-    - Normaliza dígitos isolados (número de página variável) para um placeholder.
-    - Conta quantas páginas contêm cada linha normalizada.
-    - Retorna as linhas que aparecem em >= *threshold* das páginas, ordenadas
-      pela posição média em que aparecem (as mais ao final primeiro).
-
-    Essa abordagem é genérica: funciona mesmo que o rodapé mude em PDFs
-    futuros — basta ajustar *tail_lines* e *threshold* se necessário.
-
-    Retorna lista vazia se nenhuma linha atingir o limiar.
+    titulos      : lista de strings com os titulos encontrados
+    conteudo     : texto corrido limpo
+    noise_count  : numero de chars descartados como ruido
     """
-    total = len(pages_text)
-    if total == 0:
-        return []
+    chars = page.chars
+    kept: list = []
+    noise_count = 0
 
-    line_counts: Counter[str] = Counter()
-    for text in pages_text:
-        non_empty = [l for l in text.split("\n") if l.strip()]
-        tail = non_empty[-tail_lines:] if len(non_empty) >= tail_lines else non_empty
-        seen_in_page: set[str] = set()
-        for line in tail:
-            norm = _normalize_line(line)
-            if norm and norm not in seen_in_page:
-                line_counts[norm] += 1
-                seen_in_page.add(norm)
+    for ch in chars:
+        fn_raw = ch.get("fontname", "") or ""
+        fn     = _font_base(fn_raw)
+        size   = round(float(ch.get("size", 0) or 0), 1)
+        text   = ch.get("text", "") or ""
 
-    anchors = [
-        line for line, count in line_counts.items()
-        if line != "<NUM>" and count / total >= threshold
-    ]
+        if _is_noise(fn_raw, size, text):
+            noise_count += 1
+            continue
 
-    logger.info(
-        "Detecção de boilerplate: %d linha(s) acima de %.0f%% de frequência: %s",
-        len(anchors),
-        threshold * 100,
-        anchors,
-    )
-    return anchors
+        cat = _classify_char(fn, size, section)
 
+        if cat == "discard":
+            noise_count += 1
+            continue
 
-def strip_boilerplate(text: str, anchors: list[str]) -> str:
-    """Remove blocos de rodapé/cabeçalho do texto de uma página.
+        ch2 = dict(ch)
+        ch2["_cat"] = cat
+        kept.append(ch2)
 
-    Para cada âncora em *anchors*, localiza a primeira ocorrência no texto
-    e descarta tudo a partir daí até o final da página.  A âncora deve ser
-    uma linha completa — a comparação é feita linha a linha (case-sensitive)
-    para evitar cortes acidentais em conteúdo legítimo que contenha o mesmo
-    trecho no meio de uma frase.
-
-    Se nenhuma âncora for encontrada na página, o texto é retornado intacto.
-    """
-    if not anchors:
-        return text
-
-    lines = text.split("\n")
-    for i, line in enumerate(lines):
-        if line.strip() in anchors:
-            # Remove a linha âncora e tudo que vem depois; descarta espaços
-            # em branco que possam ter ficado no final do conteúdo anterior.
-            return "\n".join(lines[:i]).rstrip()
-
-    return text
-
-
-def preview_boilerplate_removal(
-    pages: list[tuple[int, str]],
-    anchors: list[str],
-    n_samples: int = 5,
-) -> None:
-    """Imprime no console um comparativo antes/depois para revisão visual.
-
-    Seleciona *n_samples* páginas distribuídas ao longo do documento
-    (excluindo páginas sem conteúdo), imprime o texto original e o texto
-    após remoção do boilerplate, para que o operador verifique que nenhum
-    conteúdo legítimo está sendo cortado.
-    """
-    non_empty = [(pnum, text) for pnum, text in pages if text.strip()]
-    if not non_empty:
-        print("  (nenhuma página com conteúdo para amostrar)")
-        return
-
-    # Seleciona índices uniformemente espaçados
-    step = max(1, len(non_empty) // n_samples)
-    samples = non_empty[::step][:n_samples]
-
-    sep = "-" * 70
-    print(f"\n{'=' * 70}")
-    print(f"  PREVIEW — antes/depois da remoção de boilerplate ({n_samples} amostras)")
-    print(f"{'=' * 70}")
-
-    for pnum, before in samples:
-        after = strip_boilerplate(before, anchors)
-        chars_before = len(before)
-        chars_after = len(after)
-        removed = chars_before - chars_after
-        print(f"\n{sep}")
-        print(f"  Pagina {pnum}  |  antes: {chars_before} chars -> depois: {chars_after} chars  |  removidos: {removed}")
-        print(sep)
-        print("  [ANTES — últimas 6 linhas]")
-        for line in before.split("\n")[-6:]:
-            print("    " + repr(line))
-        print("  [DEPOIS — últimas 6 linhas]")
-        for line in after.split("\n")[-6:]:
-            print("    " + repr(line))
-
-    print(f"\n{'=' * 70}\n")
+    lines = _build_lines(kept)
+    titulos, conteudo = _lines_to_titles_and_conteudo(lines)
+    return titulos, conteudo, noise_count
 
 # ---------------------------------------------------------------------------
-# Montagem dos registros de índice
+# Montagem dos registros
 # ---------------------------------------------------------------------------
 
 
@@ -410,146 +473,178 @@ def build_records(
     config: DocumentConfig,
     min_chars: int,
     summary: RunSummary,
-    boilerplate_anchors: list[str] | None = None,
-    preview: bool = False,
-    n_preview_samples: int = 5,
-) -> list[PageRecord]:
-    """Extrai e limpa o texto de todas as páginas de um documento PDF.
-
-    Pipeline por página:
-    1. Extração bruta via PyMuPDF.
-    2. Limpeza de artefatos tipográficos (clean_text).
-    3. Detecção de boilerplate por frequência nas páginas limpas do lote.
-    4. Remoção do boilerplate de cada página (strip_boilerplate).
-    5. Sinalização de páginas suspeitas (poucos caracteres após limpeza).
-
-    Se *preview* for True, exibe comparativo antes/depois sem gravar nada e
-    retorna lista vazia (o chamador deve re-invocar com preview=False para
-    gerar o índice de verdade).
-
-    Em caso de falha ao abrir o documento, registra o erro em *summary* e
-    retorna lista vazia — permitindo que os outros documentos sejam
-    processados normalmente.
+) -> tuple:
     """
-    records: list[PageRecord] = []
+    Processa todas as paginas de um PDF e retorna (records, preview_data).
+
+    preview_data: dict {secao: [lista de amostras {pagina, raw, titulos, conteudo, noise}]}
+    """
+    records: list = []
+    preview_data: dict = {"indice": [], "glossario": [], "lei": []}
+    PREVIEW_SAMPLES_PER_SECTION = 3   # coletamos 3 e exibimos os 2 melhores
+
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        logger.error("pdfplumber nao instalado: %s", exc)
+        summary.documentos_com_erro += 1
+        return records, preview_data
 
     logger.info("Processando: %s -> %s", config.nome, config.arquivo)
 
     try:
-        page_iter = extract_pages_text(config.arquivo)
-    except (RuntimeError, ImportError, OSError) as exc:
-        logger.error("ERRO ao abrir '%s': %s", config.nome, exc)
-        summary.documentos_com_erro += 1
-        return records
-
-    # --- Passo 1 e 2: extração bruta + limpeza tipográfica ---
-    raw_pages: list[tuple[int, str]] = []
-    try:
-        for page_num, raw_text in page_iter:
-            raw_pages.append((page_num, clean_text(raw_text)))
+        page_section_fn, dividers, total_pages = _detect_sections(config.arquivo)
     except Exception as exc:
-        logger.error(
-            "ERRO durante extração de '%s' (a partir da página %d): %s",
-            config.nome,
-            len(raw_pages) + 1,
-            exc,
-        )
+        logger.error("Erro ao detectar secoes em '%s'.: %s", config.nome, exc)
         summary.documentos_com_erro += 1
-        return records
+        return records, preview_data
 
-    # --- Passo 3: detectar âncoras de boilerplate (se não fornecidas) ---
-    if boilerplate_anchors is None:
-        anchors = detect_boilerplate_anchors(
-            [text for _, text in raw_pages],
-            threshold=BOILERPLATE_THRESHOLD,
-        )
-    else:
-        anchors = boilerplate_anchors
+    logger.info(
+        "Secoes: institucional=1-%s | indice=%s-%s | glossario=%s-%s | lei=%s-%d",
+        (dividers.get("indice", "?") or 1) - 1,
+        dividers.get("indice", "?"),
+        (dividers.get("glossario", "?") or 1) - 1,
+        dividers.get("glossario", "?"),
+        (dividers.get("lei", "?") or 1) - 1,
+        dividers.get("lei", "?"),
+        total_pages,
+    )
 
-    # --- Passo 4 (preview): mostrar antes/depois sem gravar ---
-    if preview:
-        preview_boilerplate_removal(raw_pages, anchors, n_samples=n_preview_samples)
-        return []
+    try:
+        with pdfplumber.open(str(config.arquivo)) as pdf:
+            for page_index in range(total_pages):
+                page_num = page_index + 1
+                section  = page_section_fn(page_num)
+                page     = pdf.pages[page_index]
 
-    # --- Passo 4 (produção): remover boilerplate e montar registros ---
-    mrosc_before = 0
-    mrosc_after = 0
+                titulos, conteudo, noise_count = _extract_page(page, section)
 
-    for page_num, clean in raw_pages:
-        chars_before = len(clean)
-        final_text = strip_boilerplate(clean, anchors)
-        chars_after = len(final_text)
+                # Coleta amostras para preview (ate PREVIEW_SAMPLES_PER_SECTION por secao)
+                if section in preview_data and len(preview_data[section]) < PREVIEW_SAMPLES_PER_SECTION:
+                    if conteudo or titulos:
+                        raw_text = page.extract_text() or ""
+                        preview_data[section].append({
+                            "pagina":      page_num,
+                            "raw":         raw_text,
+                            "titulos":     titulos,
+                            "conteudo":    conteudo,
+                            "noise_count": noise_count,
+                        })
 
-        summary.total_paginas += 1
-        summary.total_caracteres_antes += chars_before
-        summary.total_caracteres_depois += chars_after
+                chars_total = len(conteudo) + sum(len(t) for t in titulos)
+                summary.total_chars_conteudo += chars_total
+                summary.total_paginas += 1
+                summary.secao_contagem[section] = summary.secao_contagem.get(section, 0) + 1
 
-        # Rastrear "MROSC" para comparativo no resumo final
-        if "MROSC" in clean:
-            mrosc_before += 1
-        if "MROSC" in final_text:
-            mrosc_after += 1
+                if chars_total < min_chars:
+                    msg = {"documento": config.nome, "pagina": page_num, "caracteres": chars_total}
+                    summary.paginas_suspeitas.append(msg)
+                    logger.warning(
+                        "Pagina suspeita (pouco texto): %s p.%d -- %d char(s).",
+                        config.nome, page_num, chars_total,
+                    )
 
-        if chars_after < min_chars:
-            msg = {
-                "documento": config.nome,
-                "pagina": page_num,
-                "caracteres": chars_after,
-            }
-            summary.paginas_suspeitas.append(msg)
-            logger.warning(
-                "Página suspeita (possível scan sem texto): %s p.%d — "
-                "apenas %d caractere(s) após limpeza.",
-                config.nome,
-                page_num,
-                chars_after,
-            )
+                records.append(PageRecord(
+                    documento=config.nome,
+                    url=config.url,
+                    pagina=page_num,
+                    secao=section,
+                    titulos=titulos,
+                    conteudo=conteudo,
+                ))
 
-        records.append(PageRecord(
-            documento=config.nome,
-            url=config.url,
-            pagina=page_num,
-            conteudo=final_text,
-        ))
+    except Exception as exc:
+        logger.error("Erro durante extracao de '%s'.: %s", config.nome, exc)
+        summary.documentos_com_erro += 1
+        return [], preview_data
 
     summary.documentos_processados += 1
-    logger.info(
-        "  OK  %d página(s) extraída(s) de '%s'.",
-        len(records),
-        config.nome,
-    )
-    logger.info(
-        "  Comparativo 'MROSC': %d páginas antes → %d após remoção de boilerplate.",
-        mrosc_before,
-        mrosc_after,
-    )
-
-    # Guarda para o resumo final (injetado no summary via atributo dinâmico)
-    if not hasattr(summary, "_mrosc_stats"):
-        summary._mrosc_stats: list[dict] = []  # type: ignore[attr-defined]
-    summary._mrosc_stats.append(  # type: ignore[attr-defined]
-        {"documento": config.nome, "mrosc_antes": mrosc_before, "mrosc_depois": mrosc_after}
-    )
-
-    return records
+    logger.info("  OK  %d paginas extraidas de '%s'.", len(records), config.nome)
+    return records, preview_data
 
 # ---------------------------------------------------------------------------
-# Escrita do JSON de saída
+# Preview
 # ---------------------------------------------------------------------------
 
 
-def write_index(records: list[PageRecord], output_path: Path) -> None:
-    """Serializa a lista de PageRecord em um arquivo JSON (UTF-8, indentado).
+def print_preview(preview_data: dict) -> None:
+    """Imprime antes/depois de paginas de amostra de cada secao."""
+    sep_major = "=" * 72
+    sep_minor = "-" * 72
 
-    Sobrescreve o arquivo caso já exista, garantindo idempotência: o script
-    pode ser re-executado a qualquer momento sem limpeza manual prévia.
-    """
+    SECAO_LABELS = {
+        "indice":    "SECAO 2 -- Indice Remissivo",
+        "glossario": "SECAO 3 -- Glossario",
+        "lei":       "SECAO 4 -- Texto da Lei",
+    }
+
+    print(f"\n{sep_major}")
+    print("  PREVIEW -- Extracao com classificacao de secao")
+    print(sep_major)
+
+    for secao, label in SECAO_LABELS.items():
+        amostras = preview_data.get(secao, [])
+        if not amostras:
+            print(f"\n[{label}] -- nenhuma amostra coletada.")
+            continue
+
+        for i, sample in enumerate(amostras[:2]):  # mostra no maximo 2
+            pnum       = sample["pagina"]
+            raw        = sample["raw"]
+            titulos    = sample["titulos"]
+            conteudo   = sample["conteudo"]
+            noise      = sample["noise_count"]
+
+            print(f"\n{sep_major}")
+            print(f"  {label}  |  Pagina {pnum}  (amostra {i+1})")
+            print(sep_major)
+
+            print("\n  [ANTES -- texto bruto da pagina (primeiros 400 chars)]")
+            print(sep_minor)
+            snippet_raw = (raw[:400] + "...") if len(raw) > 400 else raw
+            for line in snippet_raw.splitlines():
+                print(f"    {line}")
+
+            print("\n  [DEPOIS -- titulos extraidos]")
+            print(sep_minor)
+            if titulos:
+                for t in titulos:
+                    print(f"    * {t!r}")
+            else:
+                print("    (nenhum -- secao nao tem titulos)")
+
+            print("\n  [DEPOIS -- conteudo (primeiros 400 chars)]")
+            print(sep_minor)
+            snippet_con = (conteudo[:400] + "...") if len(conteudo) > 400 else conteudo
+            for line in snippet_con.splitlines():
+                print(f"    {line}")
+
+            print(f"\n  [DESCARTADO como ruido: {noise} chars/tokens (rodape + nr pagina + separadores)]")
+
+    print(f"\n{sep_major}\n")
+
+# ---------------------------------------------------------------------------
+# Escrita do JSON de saida
+# ---------------------------------------------------------------------------
+
+
+def write_index(records: list, output_path: Path) -> None:
+    """Serializa PageRecord em JSON (novo formato com secao/titulos/conteudo)."""
+    # Protecao: nunca sobrescrever o indice publicado
+    if output_path.name == _PROTECTED_OUTPUT:
+        raise ValueError(
+            f"ERRO DE SEGURANCA: tentativa de sobrescrever o arquivo protegido '{_PROTECTED_OUTPUT}'. "
+            "Use -o para especificar outro nome de saida."
+        )
+
     payload = [
         {
             "documento": r.documento,
-            "url": r.url,
-            "pagina": r.pagina,
-            "conteudo": r.conteudo,
+            "url":        r.url,
+            "pagina":     r.pagina,
+            "secao":      r.secao,
+            "titulos":    r.titulos,
+            "conteudo":   r.conteudo,
         }
         for r in records
     ]
@@ -558,53 +653,34 @@ def write_index(records: list[PageRecord], output_path: Path) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    logger.info("Índice gravado em: %s  (%d registro(s))", output_path, len(payload))
+    logger.info("Indice gravado em: %s  (%d registros)", output_path, len(payload))
 
 # ---------------------------------------------------------------------------
 # Resumo final
 # ---------------------------------------------------------------------------
 
 
-def print_summary(summary: RunSummary) -> None:
-    """Imprime no stdout um resumo legível da execução do script."""
+def print_summary(summary: RunSummary, output_path: Path | None = None) -> None:
+    """Imprime resumo legivel da execucao."""
     sep = "=" * 60
-    total_antes = summary.total_caracteres_antes
-    total_depois = summary.total_caracteres_depois
-    reducao = total_antes - total_depois
-    reducao_media = (
-        reducao / summary.total_paginas if summary.total_paginas > 0 else 0
-    )
-
     print(f"\n{sep}")
-    print("  RESUMO DA EXECUÇÃO")
+    print("  RESUMO DA EXECUCAO")
     print(sep)
     print(f"  Documentos processados com sucesso : {summary.documentos_processados}")
     print(f"  Documentos com erro                : {summary.documentos_com_erro}")
-    print(f"  Total de páginas indexadas         : {summary.total_paginas}")
-    print(f"  Caracteres antes da limpeza        : {total_antes:,}")
-    print(f"  Caracteres após a limpeza          : {total_depois:,}")
-    print(f"  Caracteres removidos (boilerplate) : {reducao:,}")
-    print(f"  Redução média por página           : {reducao_media:.0f} chars")
-    print(f"  Páginas suspeitas (baixo texto)    : {len(summary.paginas_suspeitas)}")
-
-    mrosc_stats = getattr(summary, "_mrosc_stats", [])
-    if mrosc_stats:
-        print(f"\n  Comparativo de páginas com 'MROSC':")
-        for item in mrosc_stats:
-            print(
-                f"    {item['documento']}: "
-                f"{item['mrosc_antes']} paginas antes -> "
-                f"{item['mrosc_depois']} apos remocao de boilerplate"
-            )
-
+    print(f"  Total de paginas indexadas         : {summary.total_paginas}")
+    print(f"  Total de chars (conteudo+titulos)  : {summary.total_chars_conteudo:,}")
+    print(f"  Paginas suspeitas (pouco texto)    : {len(summary.paginas_suspeitas)}")
+    if summary.secao_contagem:
+        print("\n  Paginas por secao:")
+        for sec, count in sorted(summary.secao_contagem.items()):
+            print(f"    {sec:<16} : {count}")
+    if output_path:
+        print(f"\n  Arquivo de saida: {output_path}")
     if summary.paginas_suspeitas:
-        print("\n  Páginas sinalizadas como suspeitas:")
-        for item in summary.paginas_suspeitas:
-            print(
-                f"    - {item['documento']}  —  p.{item['pagina']}"
-                f"  ({item['caracteres']} caractere(s))"
-            )
-
+        print("\n  Paginas sinalizadas:")
+        for item in summary.paginas_suspeitas[:20]:
+            print(f"    - {item['documento']}  p.{item['pagina']}  ({item['caracteres']} chars)")
     print(sep)
 
 # ---------------------------------------------------------------------------
@@ -612,70 +688,49 @@ def print_summary(summary: RunSummary) -> None:
 # ---------------------------------------------------------------------------
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv=None):
     """Define e interpreta os argumentos de linha de comando."""
     parser = argparse.ArgumentParser(
         description=(
-            "Extrai texto página a página de PDFs do Portal de Parcerias "
-            "e gera indice-documentos.json para a busca client-side."
+            "Extrai texto com classificacao de secao de PDFs do Portal de Parcerias "
+            "e gera indice-documentos.novo.json para a busca client-side."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Exemplos:\n"
             "  python ScraperMROSC.py\n"
-            "  python ScraperMROSC.py -c documentos.json -o indice-documentos.json\n"
-            "  python ScraperMROSC.py --min-chars 100\n"
             "  python ScraperMROSC.py --preview\n"
+            "  python ScraperMROSC.py -o meu-indice.json\n"
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "-c", "--config",
         metavar="ARQUIVO_CONFIG",
         type=Path,
         default=None,
-        help=(
-            "Caminho para um JSON externo com a lista de documentos. "
-            "Se omitido, usa DEFAULT_DOCUMENTS definido no topo do script."
-        ),
+        help="JSON externo com lista de documentos. Omitido = usa DEFAULT_DOCUMENTS.",
     )
     parser.add_argument(
         "-o", "--output",
         metavar="ARQUIVO_SAIDA",
         type=Path,
         default=None,
-        help=(
-            "Caminho do JSON de saída. "
-            "Padrão sem --preview: indice-documentos.json. "
-            "Padrão com --preview (ao confirmar): indice-documentos.novo.json. "
-            "O arquivo é sempre sobrescrito."
-        ),
+        help=f"Arquivo de saida JSON. Padrao: {DEFAULT_OUTPUT}",
     )
     parser.add_argument(
         "--min-chars",
         metavar="N",
         type=int,
         default=DEFAULT_MIN_CHARS,
-        help=(
-            f"Páginas com menos de N caracteres extraídos são sinalizadas "
-            f"como suspeitas no log (padrão: {DEFAULT_MIN_CHARS})."
-        ),
+        help=f"Paginas com menos de N chars sao sinalizadas (padrao: {DEFAULT_MIN_CHARS}).",
     )
     parser.add_argument(
         "--preview",
         action="store_true",
         default=False,
         help=(
-            "Imprime antes/depois de 5 páginas de amostra e aguarda "
-            "confirmação antes de gerar o índice. "
-            "O arquivo de saída padrão neste modo é indice-documentos.novo.json."
-        ),
-    )
-    parser.add_argument(
-        "--preview-samples",
-        metavar="N",
-        type=int,
-        default=5,
-        help="Número de páginas de amostra exibidas no preview (padrão: 5).",
+            "Exibe amostras antes/depois por secao e aguarda confirmacao "
+            "antes de gravar o indice."),
     )
     return parser.parse_args(argv)
 
@@ -684,32 +739,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Orquestra o pipeline completo de extração e geração do índice.
-
-    Fluxo normal:
-      carregar config → extrair páginas → detectar boilerplate →
-      preview (se --preview) → remover boilerplate → gravar JSON → resumo
-
-    Retorna 0 em sucesso total, 1 se algum documento falhou (permitindo
-    uso em pipelines CI/CD ou agendamentos com verificação de exit code).
-    """
+def main(argv=None) -> int:
+    """Orquestra o pipeline completo."""
     args = parse_args(argv)
     summary = RunSummary()
 
-    # Definir caminho de saída com base no modo
-    if args.output is not None:
-        output_path = args.output
-    elif args.preview:
-        output_path = Path("indice-documentos.novo.json")
-    else:
-        output_path = Path(DEFAULT_OUTPUT)
+    output_path = args.output if args.output is not None else Path(DEFAULT_OUTPUT)
 
-    # 1. Carregar configuração
+    # Resolve relativo ao diretorio do script (nao ao CWD)
+    if not output_path.is_absolute():
+        output_path = Path(__file__).parent / output_path
+
+    # Protecao antecipada
+    if output_path.name == _PROTECTED_OUTPUT:
+        logger.error(
+            "PROTECAO: o arquivo de saida nao pode ser '%s'. "
+            "Use -o para especificar outro nome.",
+            _PROTECTED_OUTPUT,
+        )
+        return 1
+
     try:
         documents = load_config(args.config)
     except (ValueError, json.JSONDecodeError, OSError) as exc:
-        logger.error("Falha ao carregar configuração: %s", exc)
+        logger.error("Falha ao carregar configuracao: %s", exc)
         return 1
 
     if not documents:
@@ -717,53 +770,31 @@ def main(argv: list[str] | None = None) -> int:
         print_summary(summary)
         return 0
 
-    # 2. Modo preview: mostrar antes/depois e aguardar confirmação
-    if args.preview:
-        print("\n[MODO PREVIEW] Rodando extração e detecção de boilerplate...")
-        for doc_config in documents:
-            build_records(
-                doc_config,
-                args.min_chars,
-                summary,
-                preview=True,
-                n_preview_samples=args.preview_samples,
-            )
+    all_records: list = []
+    all_preview: dict = {"indice": [], "glossario": [], "lei": []}
 
-        print(
-            f"Arquivo de saída após confirmação: {output_path}\n"
-            "Confirma a geração do índice com remoção de boilerplate? [s/N] ",
-            end="",
-            flush=True,
-        )
+    for doc_config in documents:
+        records, preview_data = build_records(doc_config, args.min_chars, summary)
+        all_records.extend(records)
+        for sec, samples in preview_data.items():
+            all_preview[sec].extend(samples)
+
+    if args.preview:
+        print_preview(all_preview)
+        print(f"Arquivo de saida: {output_path}")
+        print("Confirma a geracao do indice? [s/N] ", end="", flush=True)
         resposta = input().strip().lower()
         if resposta not in ("s", "sim", "y", "yes"):
-            print("Operação cancelada pelo usuário. Nenhum arquivo foi alterado.")
+            print("Operacao cancelada. Nenhum arquivo foi alterado.")
             return 0
 
-        # Reinicia o summary para a passagem real
-        summary = RunSummary()
-
-    # 3. Processar cada documento (passagem real)
-    all_records: list[PageRecord] = []
-    for doc_config in documents:
-        records = build_records(
-            doc_config,
-            args.min_chars,
-            summary,
-            preview=False,
-        )
-        all_records.extend(records)
-
-    # 4. Gravar o índice (idempotente — sempre sobrescreve)
     try:
         write_index(all_records, output_path)
-    except OSError as exc:
-        logger.error("Falha ao gravar o índice: %s", exc)
+    except (OSError, ValueError) as exc:
+        logger.error("Falha ao gravar o indice: %s", exc)
         return 1
 
-    # 5. Exibir resumo
-    print_summary(summary)
-
+    print_summary(summary, output_path)
     return 1 if summary.documentos_com_erro > 0 else 0
 
 
