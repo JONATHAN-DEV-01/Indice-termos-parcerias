@@ -62,7 +62,7 @@ log = logging.getLogger("scraper")
 # Constantes
 # ─────────────────────────────────────────────
 DEFAULT_URL    = "https://hom-portaldeparcerias.prefeitura.sp.gov.br/"
-DEFAULT_OUTPUT = "indice-busca.json"
+DEFAULT_OUTPUT = "indice-busca.novo.json"
 DEFAULT_DELAY  = 0.7  # segundos entre requisições
 USER_AGENT     = (
     "Mozilla/5.0 (compatible; PortalParceirasScraper/1.0; "
@@ -107,7 +107,7 @@ CLASSES_TO_REMOVE = [
 ]
 
 # Tamanho máximo do conteúdo por página (evita JSON muito grande)
-MAX_CONTEUDO_CHARS = 15000
+MAX_CONTEUDO_CHARS = 60000
 
 # Caminhos a ignorar mesmo sendo HTML (uploads renomeados, páginas internas do WP)
 IGNORE_PATH_PREFIXES = [
@@ -228,6 +228,32 @@ def separar_rodape(texto: str):
     return resto, bloco
 
 
+def extrair_subtitulos(container) -> list:
+    """Extrai subtítulos (h2, h3, h4) e o <summary> de accordions, mantendo a ordem e deduplicando."""
+    subtitulos = []
+    vistos = set()
+    for tag in container.find_all(["h2", "h3", "h4", "summary"]):
+        if tag.name == "summary":
+            # Verificar se está dentro do widget de accordion do Elementor
+            if not tag.find_parent("details", class_=re.compile(r"e-n-accordion-item")):
+                continue
+        
+        texto = tag.get_text(separator=" ", strip=True)
+        # Limpar texto
+        texto = re.sub(r"\s{2,}", " ", texto).strip()
+        
+        # Ignorar vazio ou só símbolos (precisa de pelo menos 1 caractere alfanumérico)
+        if not re.search(r"\w", texto):
+            continue
+            
+        chave = texto.lower()
+        if chave not in vistos:
+            vistos.add(chave)
+            subtitulos.append(texto)
+            
+    return subtitulos
+
+
 def extrair_conteudo_accordions(container) -> str:
     """
     Extrai explicitamente o texto dos accordions <details>/<summary> do Elementor
@@ -326,7 +352,9 @@ def extrair_conteudo(soup: BeautifulSoup):
     )
 
     if not conteudo:
-        return "", None
+        return "", None, [], 0
+
+    subtitulos = extrair_subtitulos(conteudo)
 
     # 4. Extrair texto dos accordions explicitamente (preserva título + corpo de cada painel)
     texto_accordions = extrair_conteudo_accordions(conteudo)
@@ -360,11 +388,13 @@ def extrair_conteudo(soup: BeautifulSoup):
     texto = deduplicar_paragrafos(texto)
     texto = re.sub(r"\s{2,}", " ", texto).strip()
 
+    tamanho_original = len(texto)
+
     # 10. Truncar para manter JSON compacto (preserva início do conteúdo)
-    if len(texto) > MAX_CONTEUDO_CHARS:
+    if tamanho_original > MAX_CONTEUDO_CHARS:
         texto = texto[:MAX_CONTEUDO_CHARS].rsplit(" ", 1)[0] + "…"
 
-    return texto, bloco_rodape
+    return texto, bloco_rodape, subtitulos, tamanho_original
 
 
 def extrair_titulo(soup: BeautifulSoup, url: str) -> str:
@@ -503,7 +533,7 @@ def crawl(base_url: str, delay: float, output: str) -> None:
             # Extrair dados
             titulo   = extrair_titulo(soup, url_final)
             url_can  = extrair_url_canonica(soup, url_final)
-            conteudo, bloco_rodape = extrair_conteudo(soup)
+            conteudo, bloco_rodape, subtitulos, tam_orig = extrair_conteudo(soup)
 
             # CORREÇÃO: a Home deve aparecer nos resultados de busca como
             # "Home", não com o <title> da página ("Portal de Parcerias").
@@ -522,10 +552,14 @@ def crawl(base_url: str, delay: float, output: str) -> None:
             if conteudo and len(conteudo) > 30:
                 if url_can not in urls_canonicas:
                     urls_canonicas.add(url_can)
+                    log.info("  Tamanho do conteúdo extraído: %d caracteres", tam_orig)
+                    if tam_orig > MAX_CONTEUDO_CHARS:
+                        log.warning("  ATENÇÃO: Conteúdo excedeu o limite de %d caracteres (tamanho: %d) e foi truncado!", MAX_CONTEUDO_CHARS, tam_orig)
                     indice.append({
-                        "titulo":   titulo,
-                        "url":      url_can,
-                        "conteudo": conteudo,
+                        "titulo":     titulo,
+                        "url":        url_can,
+                        "subtitulos": subtitulos,
+                        "conteudo":   conteudo,
                     })
                     total_sucesso += 1
                 else:
@@ -562,9 +596,10 @@ def crawl(base_url: str, delay: float, output: str) -> None:
     # se algum bloco de rodapé foi capturado durante o crawl.
     if rodape_capturado:
         indice.append({
-            "titulo":   TITULO_RODAPE,
-            "url":      base_url_norm,
-            "conteudo": rodape_capturado,
+            "titulo":     TITULO_RODAPE,
+            "url":        base_url_norm,
+            "subtitulos": [],
+            "conteudo":   rodape_capturado,
         })
         log.info("Entrada '%s' adicionada ao índice.", TITULO_RODAPE)
     else:
@@ -594,6 +629,15 @@ def crawl(base_url: str, delay: float, output: str) -> None:
         json.dump(indice, f, ensure_ascii=False, indent=2)
 
     log.info("Índice salvo em: %s (%d páginas)", output, len(indice))
+
+    # Exibir exemplos
+    log.info("\n=== 3 EXEMPLOS COM SUBTÍTULOS ===")
+    exemplos = [p for p in indice if p.get("subtitulos")]
+    for ex in exemplos[:3]:
+        log.info("TÍTULO: %s", ex["titulo"])
+        log.info("URL: %s", ex["url"])
+        log.info("SUBTÍTULOS:\n  - " + "\n  - ".join(ex["subtitulos"]))
+        log.info("-" * 40)
 
 
 # ─────────────────────────────────────────────
