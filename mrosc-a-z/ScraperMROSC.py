@@ -1,15 +1,18 @@
 """
 ScraperMROSC.py  (v2 -- extracao com consciencia de secao)
 ===========================================================
-Extrai texto pagina a pagina de MROSC_final.pdf usando pdfplumber,
+Extrai texto pagina a pagina do PDF "MROSC de A a Z" usando pdfplumber,
 classificando cada pagina segundo a secao do documento e separando
 titulos de conteudo com base na familia tipografica de cada caractere.
 
-Secoes detectadas automaticamente pelas paginas divisorias:
-  Secao 1 -- institucional  (capa, ficha tecnica, sumario, introducao)
-  Secao 2 -- indice         (tabela Onde Encontrar o Termo)
-  Secao 3 -- glossario      (definicoes A-Z)
-  Secao 4 -- lei            (texto da Lei nr 13.019/2014)
+Secoes detectadas automaticamente pelas paginas divisorias, em qualquer
+ordem (cada divisoria abre uma secao que vai ate a proxima divisoria):
+  "Texto da Lei"            -> lei            (texto da Lei nr 13.019/2014)
+  "Glossario"               -> glossario      (definicoes A-Z)
+  "Onde encontrar o termo"  -> indice         (so existia na versao de set/2026)
+  qualquer outra divisoria  -> institucional  (sumario, apresentacao,
+                               introducao, "Como funciona uma lei?" etc.)
+  Paginas antes da primeira divisoria tambem sao institucional.
 
 Regras de extracao por secao:
   institucional : titulos=[]  conteudo=todo nao-ruido
@@ -62,10 +65,10 @@ from pathlib import Path
 DEFAULT_DOCUMENTS: list[dict] = [
     {
         "nome": "MROSC de A a Z",
-        "arquivo": "MROSC_final.pdf",
+        "arquivo": "MROSC de A a Z  - versão final.pdf",
         "url": (
-            "https://hom-portaldeparcerias.prefeitura.sp.gov.br"
-            "/wp-content/uploads/2026/09/MROSC_final.pdf"
+            "https://portaldeparcerias.prefeitura.sp.gov.br"
+            "/wp-content/uploads/2026/11/MROSC-de-A-a-Z-vers%C3%A3o-final.pdf"
         ),
     },
 ]
@@ -83,6 +86,19 @@ _PROTECTED_OUTPUT = "indice-documentos.json"
 # Paginas divisorias sao identificadas por terem pouquissimos caracteres
 # (so o numero de pagina duplicado + o titulo da secao).
 DIVIDER_MAX_CHARS: int = 60
+
+# Atalho de desempenho: paginas com mais chars brutos que isto (contando
+# rodape e abas laterais) nem passam por extract_text na deteccao.
+DIVIDER_MAX_RAW_CHARS: int = 300
+
+# Titulo exato da divisoria (minusculo, sem digitos) -> secao.
+# Divisorias com outros titulos abrem uma secao "institucional".
+DIVIDER_TITLES: dict = {
+    "texto da lei": "lei",
+    "glossário": "glossario",
+    "glossario": "glossario",
+    "onde encontrar o termo": "indice",
+}
 
 # ---------------------------------------------------------------------------
 # Classificacao de fontes
@@ -351,16 +367,17 @@ def load_config(config_path: Path | None) -> list:
 
 
 def _normalize(text: str) -> str:
-    return " ".join(text.lower().split())
+    """Minusculas, sem digitos (numero de pagina) e com espacos simples."""
+    return " ".join(re.sub(r"\d+", " ", text).lower().split())
 
 
 def _detect_sections(pdf_path: Path):
     """
-    Varre o PDF e detecta as paginas divisorias de cada secao.
+    Varre o PDF e detecta as paginas divisorias.
 
     Retorna (page_section_fn, dividers, total_pages) onde:
       page_section_fn(page_num) -> str  ("institucional"|"indice"|"glossario"|"lei")
-      dividers: dict com as primeiras paginas de cada secao
+      dividers: lista ordenada de (pagina, titulo, secao)
       total_pages: int
     """
     try:
@@ -370,7 +387,7 @@ def _detect_sections(pdf_path: Path):
             "pdfplumber nao esta instalado. Execute: pip install pdfplumber"
         ) from exc
 
-    dividers: dict = {}
+    dividers: list = []
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         total = len(pdf.pages)
@@ -378,48 +395,30 @@ def _detect_sections(pdf_path: Path):
 
         for page_index in range(total):
             page = pdf.pages[page_index]
-            page_num = page_index + 1
+            if len(page.chars) > DIVIDER_MAX_RAW_CHARS:
+                continue
             raw = page.extract_text() or ""
-            chars_count = len(raw.strip())
-
-            if chars_count >= DIVIDER_MAX_CHARS:
+            if not raw.strip() or len(raw.strip()) >= DIVIDER_MAX_CHARS:
                 continue
 
-            norm = _normalize(raw)
+            titulo = _normalize(raw)
+            if not titulo or titulo.startswith("mrosc"):   # capa
+                continue
+            secao = DIVIDER_TITLES.get(titulo.rstrip("?").strip(), "institucional")
+            dividers.append((page_index + 1, titulo, secao))
+            logger.info("  Divisoria p.%-4d %-14s (%s)", page_index + 1, secao, titulo)
 
-            if "indice" not in dividers and "onde encontrar o termo" in norm:
-                dividers["indice"] = page_num
-                logger.info("  Divisoria indice    : pagina %d", page_num)
-
-            elif (
-                "glossario" not in dividers
-                and "indice" in dividers
-                and page_num > dividers["indice"]
-                and "gloss" in norm
-            ):
-                dividers["glossario"] = page_num
-                logger.info("  Divisoria glossario : pagina %d", page_num)
-
-            elif "lei" not in dividers and "texto da lei" in norm:
-                dividers["lei"] = page_num
-                logger.info("  Divisoria lei       : pagina %d", page_num)
-
-    for key in ("indice", "glossario", "lei"):
-        if key not in dividers:
-            logger.warning("Divisoria '%s' NAO encontrada!", key)
-
-    si = dividers.get("indice")
-    sg = dividers.get("glossario")
-    sl = dividers.get("lei")
+    for secao in ("glossario", "lei"):
+        if not any(d[2] == secao for d in dividers):
+            logger.warning("Divisoria da secao '%s' NAO encontrada!", secao)
 
     def page_section(p: int) -> str:
-        if sl and p >= sl:
-            return "lei"
-        if sg and p >= sg:
-            return "glossario"
-        if si and p >= si:
-            return "indice"
-        return "institucional"
+        atual = "institucional"
+        for pagina, _titulo, secao in dividers:
+            if pagina > p:
+                break
+            atual = secao
+        return atual
 
     return page_section, dividers, total
 
@@ -499,16 +498,17 @@ def build_records(
         summary.documentos_com_erro += 1
         return records, preview_data
 
-    logger.info(
-        "Secoes: institucional=1-%s | indice=%s-%s | glossario=%s-%s | lei=%s-%d",
-        (dividers.get("indice", "?") or 1) - 1,
-        dividers.get("indice", "?"),
-        (dividers.get("glossario", "?") or 1) - 1,
-        dividers.get("glossario", "?"),
-        (dividers.get("lei", "?") or 1) - 1,
-        dividers.get("lei", "?"),
-        total_pages,
-    )
+    faixas = []
+    inicios = [(1, "institucional")] + [(d[0], d[2]) for d in dividers]
+    for i, (inicio, secao) in enumerate(inicios):
+        fim = inicios[i + 1][0] - 1 if i + 1 < len(inicios) else total_pages
+        if fim < inicio:
+            continue
+        if faixas and faixas[-1][2] == secao:
+            faixas[-1][1] = fim
+        else:
+            faixas.append([inicio, fim, secao])
+    logger.info("Secoes: %s", " | ".join("%s=%d-%d" % (sec, a, b) for a, b, sec in faixas))
 
     try:
         with pdfplumber.open(str(config.arquivo)) as pdf:

@@ -86,7 +86,7 @@ log = logging.getLogger("scraper")
 # ─────────────────────────────────────────────
 # Constantes
 # ─────────────────────────────────────────────
-DEFAULT_URL    = "https://hom-portaldeparcerias.prefeitura.sp.gov.br/"
+DEFAULT_URL    = "https://portaldeparcerias.prefeitura.sp.gov.br/"
 DEFAULT_OUTPUT = str(Path(__file__).resolve().parent / "indice-busca.novo.json")
 DEFAULT_DELAY  = 0.7  # segundos entre requisições
 USER_AGENT     = (
