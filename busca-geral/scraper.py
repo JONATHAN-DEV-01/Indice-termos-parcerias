@@ -105,6 +105,9 @@ TAGS_TO_REMOVE = [
 CLASSES_TO_REMOVE = [
     # Widget de Libras (Hand Talk), injetado em todas as páginas
     "ht-addons-exception",
+    # Link de acessibilidade "Pular para o conteúdo principal", criado por
+    # JavaScript em todas as páginas
+    "pp-skip-link",
     # Texto só para leitor de tela: repete o nome do item + "(abre em nova aba)"
     "capacitacoes-sr-only", "manuais-sr-only",
     # Barras de filtro, contadores e mensagens de lista vazia
@@ -172,6 +175,13 @@ HOSTS_BLOQUEADOS = (
 )
 
 MIN_OCORRENCIAS_LOREM = 3
+
+# Páginas acessíveis ao usuário que o crawl não acha seguindo <a href>: entram
+# na fila logo no início. A Política de Privacidade só tem link dentro do
+# banner de cookies, montado por JavaScript a partir de uma configuração.
+URLS_INICIAIS_EXTRAS = [
+    "/politica-de-privacidade-e-cookies/",
+]
 
 # Páginas alcançáveis por link que não devem aparecer na busca.
 URLS_EXCLUIDAS = {
@@ -648,6 +658,7 @@ def _crawl(base_url: str, delay: float, output: str, renderizador: Renderizador)
     visitadas       = set()
     urls_canonicas  = set()   # para deduplicar por URL canônica
     fila            = deque([base_url_norm])
+    fila.extend(normalizar_url(urljoin(base_url_norm, caminho)) for caminho in URLS_INICIAIS_EXTRAS)
     indice          = []
 
     # CORREÇÃO: guarda o primeiro bloco de rodapé encontrado (é idêntico
